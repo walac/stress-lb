@@ -3,11 +3,13 @@
 use affinity::*;
 use clap::Parser;
 use core::mem;
+use duration_str;
 use errno::errno;
 use libc::c_void;
+use scheduler::{set_self_policy, Policy};
 use signal_hook::iterator::Signals;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
-use std::{error::Error, ops::Drop, ptr, thread, time::Duration};
+use std::{error::Error, ops::Drop, ptr, sync::mpsc, thread, time::Duration};
 use volatile::Volatile;
 
 struct TimerId(*mut c_void);
@@ -23,13 +25,13 @@ impl Drop for TimerId {
 struct Timer(TimerId);
 
 impl Timer {
-    pub fn new(thr: &thread::Thread, dur: &Duration) -> Result<Self, Box<dyn Error>> {
+    pub fn new(thread_id: i32, dur: &Duration) -> Result<Self, Box<dyn Error>> {
         let mut timerid = TimerId(ptr::null_mut());
         let mut sigev: libc::sigevent = unsafe { mem::zeroed() };
 
         sigev.sigev_notify = libc::SIGEV_THREAD_ID;
         sigev.sigev_signo = libc::SIGALRM;
-        sigev.sigev_notify_thread_id = thr.id().as_u64().get() as i32;
+        sigev.sigev_notify_thread_id = thread_id;
 
         let mut ret;
         unsafe {
@@ -68,12 +70,20 @@ struct TimerThread {
 }
 
 impl TimerThread {
-    pub fn new(interval: &Duration, quit: Arc<AtomicBool>) -> Result<Self, Box<dyn Error>> {
+    pub fn new(
+        interval: &Duration,
+        priority: u32,
+        quit: Arc<AtomicBool>,
+    ) -> Result<Self, Box<dyn Error>> {
         let mut signals = Signals::new(&[signal_hook::consts::SIGALRM])?;
 
+        let (tx, rx) = mpsc::channel();
+
         let handle = thread::spawn(move || {
+            tx.send(unsafe { libc::gettid() }).unwrap();
             let core_mask: Vec<usize> = (0..1).collect();
             set_thread_affinity(&core_mask).unwrap();
+            set_self_policy(Policy::Fifo, priority as i32).unwrap();
             for _ in signals.forever() {
                 if quit.load(Ordering::Acquire) {
                     return;
@@ -81,7 +91,8 @@ impl TimerThread {
             }
         });
 
-        let timer = Timer::new(&handle.thread(), interval)?;
+        let thread_id = rx.recv()?;
+        let timer = Timer::new(thread_id, interval)?;
 
         Ok(TimerThread {
             timer: Some(timer),
@@ -133,8 +144,33 @@ struct Args {
 
     #[clap(short, long)]
     interval: Option<String>,
+
+    #[clap(short, long, default_value_t = 1)]
+    priority: u32,
 }
 
 fn main() {
     let args = Args::parse();
+
+    let interval =
+        duration_str::parse(&args.interval.or(Some("1ms".to_string())).unwrap()).unwrap();
+
+    let quit = Arc::new(AtomicBool::new(false));
+
+    let threads = run_worker_threads(quit.clone(), args.threads_per_core);
+
+    let mut timer = TimerThread::new(&interval, args.priority, quit.clone()).unwrap();
+
+    let dur = match args.duration {
+        Some(d) => duration_str::parse(&d).unwrap(),
+        None => Duration::MAX,
+    };
+
+    thread::sleep(dur);
+    quit.store(true, Ordering::Release);
+    timer.join().unwrap();
+
+    for t in threads {
+        t.join().unwrap();
+    }
 }
