@@ -109,6 +109,9 @@ fn run_worker_threads(
 ) -> Vec<thread::JoinHandle<()>> {
     let num_threads = (get_core_num() - 1) * threads_per_core;
 
+    println!("This machine has {} CPUs\n", get_core_num());
+    println!("Starting {} worker threads...\n", num_threads);
+
     (0..num_threads)
         .map(move |_| {
             let myquit = quit.clone();
@@ -157,6 +160,7 @@ fn main() {
 
     let threads = run_worker_threads(quit.clone(), args.threads_per_core);
 
+    println!("Starting the timer thread...\n");
     let mut timer = TimerThread::new(&interval, args.priority, quit.clone()).unwrap();
 
     let dur = match args.duration {
