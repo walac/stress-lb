@@ -1,5 +1,3 @@
-#![feature(thread_id_value)]
-
 use affinity::*;
 use clap::Parser;
 use core::mem;
