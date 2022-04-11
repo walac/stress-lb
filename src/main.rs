@@ -3,11 +3,13 @@ use clap::Parser;
 use core::mem;
 use duration_str;
 use errno::errno;
+use gettid::gettid;
 use libc::c_void;
 use scheduler::{set_self_policy, Policy};
 use signal_hook::iterator::Signals;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
-use std::{error::Error, ops::Drop, ptr, sync::mpsc, thread, time::Duration};
+use std::time::{Duration, Instant};
+use std::{cmp, error::Error, ops::Drop, ptr, sync::mpsc, thread};
 use volatile::Volatile;
 
 struct TimerId(*mut c_void);
@@ -76,21 +78,44 @@ impl TimerThread {
         let mut signals = Signals::new(&[signal_hook::consts::SIGALRM])?;
 
         let (tx, rx) = mpsc::channel();
+        let mut checkpoint = Instant::now();
+        let delay = interval.clone();
 
         let handle = thread::spawn(move || {
-            tx.send(unsafe { libc::gettid() }).unwrap();
+            tx.send(gettid()).unwrap();
+
             let core_mask: Vec<usize> = (0..1).collect();
             set_thread_affinity(&core_mask).unwrap();
             set_self_policy(Policy::Fifo, priority as i32).unwrap();
+
+            let mut count: u128 = 0;
+            let mut sum: u128 = 0;
+            let mut max_latency: usize = 0;
+
             for _ in signals.forever() {
                 if quit.load(Ordering::Acquire) {
+                    println!("Average latency = {}us", sum / count);
+                    println!("Maximum latency = {}us", max_latency);
                     return;
                 }
+
+                let diff = Instant::now().duration_since(checkpoint);
+                let latency = if diff > delay {
+                    diff - delay
+                } else {
+                    Duration::new(0, 0)
+                };
+
+                count += 1;
+                sum += latency.as_micros();
+                max_latency = cmp::max(max_latency, latency.as_micros() as usize);
+
+                checkpoint = Instant::now();
             }
         });
 
         let thread_id = rx.recv()?;
-        let timer = Timer::new(thread_id, interval)?;
+        let timer = Timer::new(thread_id as i32, interval)?;
 
         Ok(TimerThread {
             timer: Some(timer),
@@ -107,16 +132,17 @@ fn run_worker_threads(
     quit: Arc<AtomicBool>,
     threads_per_core: usize,
 ) -> Vec<thread::JoinHandle<()>> {
-    let num_threads = (get_core_num() - 1) * threads_per_core;
+    let ncpus = get_core_num();
+    let num_threads = (ncpus - 1) * threads_per_core;
 
-    println!("This machine has {} CPUs\n", get_core_num());
-    println!("Starting {} worker threads...\n", num_threads);
+    println!("This machine has {} CPUs", ncpus);
+    println!("Starting {} worker threads...", num_threads);
 
     (0..num_threads)
         .map(move |_| {
             let myquit = quit.clone();
             thread::spawn(move || {
-                let core_mask: Vec<usize> = (1..get_core_num()).collect();
+                let core_mask: Vec<usize> = (1..ncpus).collect();
                 set_thread_affinity(&core_mask).unwrap();
 
                 let mut dummy: u64 = 0;
@@ -160,7 +186,7 @@ fn main() {
 
     let threads = run_worker_threads(quit.clone(), args.threads_per_core);
 
-    println!("Starting the timer thread...\n");
+    println!("Starting the timer thread...");
     let mut timer = TimerThread::new(&interval, args.priority, quit.clone()).unwrap();
 
     let dur = match args.duration {
